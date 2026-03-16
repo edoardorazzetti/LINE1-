@@ -1,0 +1,266 @@
+# =============================================================================
+# Analisi completa: SIRT6, LDHA, PDK1, PDK3
+# Adenoma vs Adenoma Adjacent
+# =============================================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from scipy.stats import zscore
+import requests
+from io import StringIO
+import statsmodels.api as sm
+import time
+
+# -----------------------------------------------------------------------------
+# 1. Load data
+# -----------------------------------------------------------------------------
+
+data = pd.read_csv(
+    "C:/Users/edino/OneDrive/Desktop/tesi/00_Input/fulldataset.csv",
+    low_memory=False
+)
+print(f"Dataset caricato: {data.shape}")
+
+# -----------------------------------------------------------------------------
+# 2. Extract metadata and filter Adenoma samples
+# -----------------------------------------------------------------------------
+
+tissue_info = pd.DataFrame({
+    "Sample": data.columns[1:],
+    "Tissue": data.iloc[1, 1:].values
+})
+
+campioni_adenoma = tissue_info[
+    tissue_info["Tissue"].isin(["Adenoma", "Adenoma adjacent"])
+]["Sample"].tolist()
+
+data_adenoma     = data[["ID"] + campioni_adenoma].copy()
+metadata_adenoma = tissue_info[
+    tissue_info["Tissue"].isin(["Adenoma", "Adenoma adjacent"])
+].reset_index(drop=True)
+
+# Crea colonna ID pulita (senza suffisso versione)
+data_adenoma["ID_clean"] = data_adenoma["ID"].str.replace(r"\..*", "", regex=True)
+
+print(f"Campioni selezionati: {len(campioni_adenoma)}")
+
+# -----------------------------------------------------------------------------
+# 3. Funzione per recuperare trascritti da Ensembl (con retry)
+# -----------------------------------------------------------------------------
+
+def get_transcripts(gene_name, max_retries=5):
+    for attempt in range(max_retries):
+        query = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE Query>
+<Query virtualSchemaName="default" formatter="TSV" header="0" uniqueRows="0" count="" datasetConfigVersion="0.6">
+    <Dataset name="hsapiens_gene_ensembl" interface="default">
+        <Filter name="external_gene_name" value="{gene_name}"/>
+        <Attribute name="ensembl_transcript_id"/>
+        <Attribute name="external_gene_name"/>
+    </Dataset>
+</Query>"""
+        url = "https://ensembl.org/biomart/martservice"
+        response = requests.get(url, params={"query": query})
+        df = pd.read_csv(StringIO(response.text), sep="\t",
+                         names=["ensembl_transcript_id", "external_gene_name"])
+        if not df["ensembl_transcript_id"].str.contains("ERROR", na=True).any():
+            print(f"{gene_name}: {len(df)} trascritti trovati")
+            return df
+        print(f"{gene_name}: tentativo {attempt+1}/{max_retries} fallito, riprovo...")
+        time.sleep(3)
+    print(f"ATTENZIONE: {gene_name} non trovato!")
+    return pd.DataFrame(columns=["ensembl_transcript_id", "external_gene_name"])
+
+sirt6_transcripts = get_transcripts("SIRT6")
+ldha_transcripts  = get_transcripts("LDHA")
+pdk1_transcripts  = get_transcripts("PDK1")
+pdk3_transcripts  = get_transcripts("PDK3")
+
+# -----------------------------------------------------------------------------
+# 4. Funzione per calcolare mediana per campione
+# -----------------------------------------------------------------------------
+
+def get_mediana(transcripts_df, gene_col_name):
+    expr = data_adenoma[
+        data_adenoma["ID_clean"].isin(transcripts_df["ensembl_transcript_id"])
+    ].drop(columns="ID_clean").copy()
+    print(f"{gene_col_name}: {len(expr)} trascritti trovati nel dataset")
+    for col in campioni_adenoma:
+        expr[col] = pd.to_numeric(expr[col], errors="coerce")
+    mediana = expr[campioni_adenoma].median().reset_index()
+    mediana.columns = ["Sample", gene_col_name]
+    return mediana
+
+sirt6_mediana = get_mediana(sirt6_transcripts, "SIRT6")
+ldha_mediana  = get_mediana(ldha_transcripts,  "LDHA")
+pdk1_mediana  = get_mediana(pdk1_transcripts,  "PDK1")
+pdk3_mediana  = get_mediana(pdk3_transcripts,  "PDK3")
+
+# -----------------------------------------------------------------------------
+# 5. Merge e pulizia NaN
+# -----------------------------------------------------------------------------
+
+df = sirt6_mediana \
+    .merge(ldha_mediana,  on="Sample") \
+    .merge(pdk1_mediana,  on="Sample") \
+    .merge(pdk3_mediana,  on="Sample") \
+    .merge(metadata_adenoma, on="Sample")
+
+df_clean = df[["Sample", "Tissue", "LDHA", "SIRT6", "PDK1", "PDK3"]] \
+    .replace([np.inf, -np.inf], np.nan) \
+    .dropna()
+
+print(f"\nNaN per colonna:\n{df[['LDHA','SIRT6','PDK1','PDK3']].isnull().sum()}")
+print(f"Campioni disponibili dopo pulizia: {len(df_clean)}")
+
+# -----------------------------------------------------------------------------
+# 6. Boxplot SIRT6, LDHA, PDK1, PDK3
+# -----------------------------------------------------------------------------
+
+palette = {"Adenoma": "#E69F00", "Adenoma adjacent": "#56B4E9"}
+fig, axes = plt.subplots(1, 4, figsize=(18, 5))
+
+for ax, gene in zip(axes, ["SIRT6", "LDHA", "PDK1", "PDK3"]):
+    col_data = df_clean if gene in df_clean.columns else df
+    groups = [
+        df_clean[df_clean["Tissue"] == "Adenoma"][gene].values,
+        df_clean[df_clean["Tissue"] == "Adenoma adjacent"][gene].values
+    ]
+    stat, pval = stats.mannwhitneyu(*groups, alternative="two-sided")
+    sig = "***" if pval < 0.001 else "**" if pval < 0.01 else "*" if pval < 0.05 else "ns"
+
+    sns.boxplot(data=df_clean, x="Tissue", y=gene, palette=palette, ax=ax)
+    sns.stripplot(data=df_clean, x="Tissue", y=gene,
+                  color="black", alpha=0.5, size=4, ax=ax)
+    y_max = df_clean[gene].max() * 1.1
+    ax.plot([0, 1], [y_max, y_max], color="black", linewidth=1)
+    ax.text(0.5, y_max * 1.02, f"{sig}\np={pval:.3f}", ha="center", fontsize=9)
+    ax.set_title(gene, fontsize=13)
+    ax.set_xlabel("")
+    ax.set_ylabel("Mediana espressione")
+    sns.despine(ax=ax)
+
+plt.suptitle("Espressione genica — Adenoma vs Adenoma Adjacent", fontsize=14, y=1.02)
+plt.tight_layout()
+plt.savefig("boxplot_tutti_geni.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+# -----------------------------------------------------------------------------
+# 7. Regressione multipla: LDHA ~ SIRT6 + PDK1 + PDK3
+# -----------------------------------------------------------------------------
+
+X       = df_clean[["SIRT6", "PDK1", "PDK3"]]
+y       = df_clean["LDHA"]
+X_const = sm.add_constant(X)
+modello = sm.OLS(y, X_const).fit()
+
+print("\n===== RISULTATI REGRESSIONE MULTIPLA =====")
+print(modello.summary())
+
+# Barplot coefficienti
+coef   = modello.params[1:]
+ci     = modello.conf_int().iloc[1:]
+pval   = modello.pvalues[1:]
+colors = ["#E69F00" if p < 0.05 else "#999999" for p in pval]
+
+fig, ax = plt.subplots(figsize=(6, 4))
+ax.barh(coef.index, coef.values, color=colors,
+        xerr=[coef.values - ci[0].values, ci[1].values - coef.values],
+        capsize=4, error_kw={"linewidth": 1.5})
+ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
+ax.set_xlabel("Coefficiente di regressione")
+ax.set_title("LDHA ~ SIRT6 + PDK1 + PDK3\n(arancione = p < 0.05)")
+sns.despine()
+plt.tight_layout()
+plt.savefig("regressione_multipla_LDHA.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+# -----------------------------------------------------------------------------
+# 8. Scatter plot predittori vs LDHA
+# -----------------------------------------------------------------------------
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+for ax, gene in zip(axes, ["SIRT6", "PDK1", "PDK3"]):
+    slope, intercept, r, pv, _ = stats.linregress(df_clean[gene], df_clean["LDHA"])
+    x_line = np.linspace(df_clean[gene].min(), df_clean[gene].max(), 100)
+    for tissue, group in df_clean.groupby("Tissue"):
+        ax.scatter(group[gene], group["LDHA"],
+                   label=tissue, color=palette[tissue], alpha=0.8, s=50)
+    ax.plot(x_line, intercept + slope * x_line, color="black", linewidth=1.5)
+    ax.set_title(f"LDHA ~ {gene}\nR²={r**2:.3f}  p={pv:.4f}", fontsize=11)
+    ax.set_xlabel(f"Mediana {gene}")
+    ax.set_ylabel("Mediana LDHA")
+    ax.legend(fontsize=8)
+    sns.despine(ax=ax)
+
+plt.suptitle("Correlazioni con LDHA", fontsize=13, y=1.02)
+plt.tight_layout()
+plt.savefig("scatter_LDHA_predittori.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+# -----------------------------------------------------------------------------
+# 9. Matrice di correlazione Spearman
+# -----------------------------------------------------------------------------
+
+corr_matrix = df_clean[["LDHA", "SIRT6", "PDK1", "PDK3"]].corr(method="spearman")
+
+fig, ax = plt.subplots(figsize=(6, 5))
+sns.heatmap(corr_matrix, annot=True, fmt=".2f", cmap="RdBu_r",
+            vmin=-1, vmax=1, square=True, linewidths=0.5, ax=ax)
+ax.set_title("Matrice di correlazione Spearman\nLDHA, SIRT6, PDK1, PDK3")
+plt.tight_layout()
+plt.savefig("correlation_matrix.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+# -----------------------------------------------------------------------------
+# 10. Heatmap espressione
+# -----------------------------------------------------------------------------
+
+from matplotlib.patches import Patch
+
+sirt6_row = data_adenoma[data_adenoma["ID_clean"].isin(
+    sirt6_transcripts["ensembl_transcript_id"])][campioni_adenoma].apply(
+    pd.to_numeric, errors="coerce").median().rename("SIRT6")
+
+ldha_row = data_adenoma[data_adenoma["ID_clean"].isin(
+    ldha_transcripts["ensembl_transcript_id"])][campioni_adenoma].apply(
+    pd.to_numeric, errors="coerce").median().rename("LDHA")
+
+pdk1_row = data_adenoma[data_adenoma["ID_clean"].isin(
+    pdk1_transcripts["ensembl_transcript_id"])][campioni_adenoma].apply(
+    pd.to_numeric, errors="coerce").median().rename("PDK1")
+
+pdk3_row = data_adenoma[data_adenoma["ID_clean"].isin(
+    pdk3_transcripts["ensembl_transcript_id"])][campioni_adenoma].apply(
+    pd.to_numeric, errors="coerce").median().rename("PDK3")
+
+heatmap_mat    = pd.DataFrame([sirt6_row, ldha_row, pdk1_row, pdk3_row])
+heatmap_zscore = heatmap_mat.apply(zscore, axis=1)
+
+col_colors = metadata_adenoma.set_index("Sample")["Tissue"].map(palette)
+
+g = sns.clustermap(
+    heatmap_zscore,
+    col_colors  = col_colors,
+    row_cluster = False,
+    cmap        = "RdBu_r",
+    figsize     = (14, 4),
+    xticklabels = False,
+    yticklabels = True,
+    cbar_kws    = {"label": "Z-score"},
+    linewidths  = 0
+)
+g.fig.suptitle("Espressione SIRT6, LDHA, PDK1, PDK3 — Adenoma vs Adenoma Adjacent",
+               y=1.05, fontsize=13)
+legend_elements = [
+    Patch(facecolor="#E69F00", label="Adenoma"),
+    Patch(facecolor="#56B4E9", label="Adenoma adjacent")
+]
+g.ax_heatmap.legend(handles=legend_elements, loc="upper right",
+                    bbox_to_anchor=(1.15, 1.3), frameon=False)
+plt.savefig("heatmap_tutti_geni.png", dpi=150, bbox_inches="tight")
+plt.show()
