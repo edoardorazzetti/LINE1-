@@ -1,0 +1,456 @@
+# =============================================================================
+# adenoma_analysis_final.R
+# 
+# Sporadic colorectal adenoma analysis:
+#   - ORF1p / ORF2p expression by polip grade (DESeq2 VST-normalized)
+#   - SIRT6, LDHA, PDK1, PDK3, MET, L1-MET expression:
+#     Adenoma vs Adjacent mucosa vs Healthy colon (GTEx)
+#   - Correlation heatmap and regression plots
+#
+# Author : Edoardo Razzetti
+# Tutor  : Prof.ssa Tiziana Venesio
+# Co-tutor: Dr. Giulio Ferrero
+# Affiliation: Candiolo Cancer Institute (IRCCS) / University of Turin
+# =============================================================================
+
+# ── 0. PATHS — MODIFY ONLY THESE LINES ───────────────────────────────────────
+BASE_DIR        <- "C:/Users/edino/OneDrive/Desktop/orf"
+PATH_META       <- file.path(BASE_DIR, "metadata.xlsx")
+PATH_FULL       <- file.path(BASE_DIR, "fulldataset.csv")
+PATH_REPEAT     <- file.path(BASE_DIR, "Table_AA_repeated_element_ (1).txt")
+PATH_GTEX_GENES <- "C:/Users/edino/OneDrive/Documents/gtex_colon_output/TPM_SIRT6_PDK1_PDK3_LDHA.tsv"
+OUTPUT_DIR      <- BASE_DIR
+
+# ── 1. PACKAGES ───────────────────────────────────────────────────────────────
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+for (pkg in c("readxl","dplyr","tidyr","ggplot2","ggpubr",
+              "ggcorrplot","patchwork","data.table")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+}
+if (!requireNamespace("DESeq2", quietly = TRUE)) BiocManager::install("DESeq2")
+
+library(readxl);   library(dplyr);     library(tidyr)
+library(ggplot2);  library(ggpubr);    library(ggcorrplot)
+library(patchwork); library(data.table); library(DESeq2)
+
+# ── 2. TRANSCRIPT LISTS ───────────────────────────────────────────────────────
+SIRT6_TR <- c("ENST00000262878","ENST00000484342","ENST00000463413",
+              "ENST00000467966","ENST00000395833","ENST00000468083",
+              "ENST00000493829","ENST00000485864","ENST00000482276")
+LDHA_TR  <- c("ENST00000563787","ENST00000566401","ENST00000562799",
+              "ENST00000261509","ENST00000569128","ENST00000564515",
+              "ENST00000568840","ENST00000542301","ENST00000558404",
+              "ENST00000559033","ENST00000561519","ENST00000395248")
+PDK1_TR  <- c("ENST00000255506","ENST00000395908","ENST00000462419",
+              "ENST00000468375","ENST00000471218","ENST00000474520",
+              "ENST00000478142","ENST00000482527")
+PDK3_TR  <- c("ENST00000295887","ENST00000378444","ENST00000395872",
+              "ENST00000440093","ENST00000462398","ENST00000468380",
+              "ENST00000479578","ENST00000484424")
+L1MET_ID <- "ENST00000495962"
+MET_ID   <- "ENST00000397752"
+
+# LINE-1 strata for ORF proxies
+STRATO1 <- c("L1HS","L1PA2","L1PA3")
+STRATO2 <- c("L1PA4","L1PA5","L1PA6","L1PA7","L1PA8","L1PA8A",
+             "L1PA10","L1PA11","L1PA12","L1PA13","L1PA14",
+             "L1PA15","L1PA15-16","L1PA16","L1PA17")
+
+# ── 3. COLOUR PALETTES ────────────────────────────────────────────────────────
+pal_tissue <- c("Healthy (GTEx)" = "#5B8DB8",
+                "Adjacent"       = "#8CC78C",
+                "Adenoma"        = "#E05C5C")
+pal_grade  <- c("High"    = "#D62728",
+                "Low"     = "#AEC7E8",
+                "Unknown" = "#AAAAAA")
+pal_orf    <- c("ORF1p"   = "#E05C5C",
+                "ORF2p"   = "#5B8DB8")
+
+# ── 4. METADATA ───────────────────────────────────────────────────────────────
+cat("[ 1/8 ] Loading metadata...\n")
+meta <- as.data.frame(read_excel(PATH_META))
+rownames(meta) <- meta[[1]]
+meta <- meta[, -1]
+
+adenoma_mask <- grepl("Adenoma$", meta$Tissue) &
+                !grepl("adjacent", meta$Tissue, ignore.case = TRUE)
+braf_mask    <- grepl("Mutated", meta$BRAF, ignore.case = TRUE)
+adj_mask     <- grepl("Adenoma adjacent", meta$Tissue, ignore.case = TRUE)
+
+adenoma_samples  <- rownames(meta)[adenoma_mask & !braf_mask]
+adjacent_samples <- rownames(meta)[adj_mask]
+braf_excluded    <- rownames(meta)[adenoma_mask & braf_mask]
+
+cat(sprintf("    Adenomas (excl. BRAF): %d\n", length(adenoma_samples)))
+cat(sprintf("    BRAF excluded:         %s\n", paste(braf_excluded, collapse = ", ")))
+cat(sprintf("    Adenoma-adjacent:      %d\n", length(adjacent_samples)))
+
+# ── 5. EXPRESSION DATA ────────────────────────────────────────────────────────
+cat("[ 2/8 ] Loading expression data (TPM)...\n")
+full_raw   <- read.csv(PATH_FULL, row.names = 1, check.names = FALSE,
+                       stringsAsFactors = FALSE)
+expr_raw   <- full_raw[-(1:2), ]
+ids_full   <- sub("\\..*", "", rownames(full_raw)[-(1:2)])
+target_ids <- c(SIRT6_TR, LDHA_TR, PDK1_TR, PDK3_TR, L1MET_ID, MET_ID)
+
+keep_tr    <- ids_full %in% target_ids
+expr_small <- as.data.frame(apply(expr_raw[keep_tr, ], 2, as.numeric))
+ids_small  <- ids_full[keep_tr]
+
+# Helper: mean TPM across transcripts for a given sample vector
+get_expr <- function(tr_set, label, samples) {
+  rows <- expr_small[ids_small %in% tr_set,
+                     colnames(expr_small) %in% samples, drop = FALSE]
+  cat(sprintf("    %s: %d/%d transcripts found\n", label, nrow(rows), length(tr_set)))
+  if (nrow(rows) == 0) return(setNames(rep(NA_real_, length(samples)), samples))
+  colMeans(rows, na.rm = TRUE)[samples]
+}
+
+# Adenomas
+sirt6_adn <- get_expr(SIRT6_TR, "SIRT6",  adenoma_samples)
+ldha_adn  <- get_expr(LDHA_TR,  "LDHA",   adenoma_samples)
+pdk1_adn  <- get_expr(PDK1_TR,  "PDK1",   adenoma_samples)
+pdk3_adn  <- get_expr(PDK3_TR,  "PDK3",   adenoma_samples)
+l1met_adn <- get_expr(L1MET_ID, "L1-MET", adenoma_samples)
+met_adn   <- get_expr(MET_ID,   "MET",    adenoma_samples)
+
+# Adjacent
+sirt6_adj <- get_expr(SIRT6_TR, "SIRT6",  adjacent_samples)
+ldha_adj  <- get_expr(LDHA_TR,  "LDHA",   adjacent_samples)
+pdk1_adj  <- get_expr(PDK1_TR,  "PDK1",   adjacent_samples)
+pdk3_adj  <- get_expr(PDK3_TR,  "PDK3",   adjacent_samples)
+l1met_adj <- get_expr(L1MET_ID, "L1-MET", adjacent_samples)
+met_adj   <- get_expr(MET_ID,   "MET",    adjacent_samples)
+
+# ── 6. LINE-1 ORF PROXIES (DESeq2 VST) ───────────────────────────────────────
+cat("[ 3/8 ] Normalizing LINE-1 counts with DESeq2 VST...\n")
+rep_raw     <- read.table(PATH_REPEAT, sep = "\t", header = TRUE,
+                          row.names = 1, check.names = FALSE)
+rep_adenoma <- rep_raw[, colnames(rep_raw) %in% adenoma_samples]
+cat(sprintf("    Samples in repeat file: %d\n", ncol(rep_adenoma)))
+
+count_mat <- round(as.matrix(rep_adenoma))
+count_mat[count_mat < 0] <- 0
+
+col_data <- data.frame(sample    = colnames(count_mat),
+                       row.names = colnames(count_mat))
+dds  <- DESeqDataSetFromMatrix(count_mat, col_data, ~1)
+keep <- rowSums(counts(dds) >= 10) >= 3
+dds  <- dds[keep, ]
+cat(sprintf("    Rows after filter (counts >= 10 in >= 3 samples): %d\n", sum(keep)))
+
+dds     <- estimateSizeFactors(dds)
+vst_mat <- assay(varianceStabilizingTransformation(dds, blind = TRUE))
+cat("    VST complete\n")
+
+# ORF proxies — subfam derived from vst_mat rownames (post-filter)
+subfam    <- sub(":.*", "", rownames(vst_mat))
+l1_idx    <- grepl(":L1:LINE", rownames(vst_mat))
+vst_l1    <- vst_mat[l1_idx, ]
+subfam_l1 <- subfam[l1_idx]
+
+cat(sprintf("    Strato1 subfamilies (ORF1+ORF2): %d\n", sum(subfam_l1 %in% STRATO1)))
+cat(sprintf("    Strato2 subfamilies (ORF1 only):  %d\n", sum(subfam_l1 %in% STRATO2)))
+
+s1    <- colSums(vst_l1[subfam_l1 %in% STRATO1, , drop = FALSE])
+s2    <- colSums(vst_l1[subfam_l1 %in% STRATO2, , drop = FALSE])
+orf1p <- s1 + s2
+orf2p <- s1
+
+# Save VST matrix
+write.table(as.data.frame(vst_mat),
+            file.path(OUTPUT_DIR, "repeats_VST_normalized.tsv"),
+            sep = "\t", quote = FALSE)
+
+# ── 7. BUILD DATAFRAMES ───────────────────────────────────────────────────────
+cat("[ 4/8 ] Building dataframes...\n")
+
+adn_df <- data.frame(
+  Sample = adenoma_samples,
+  SIRT6  = sirt6_adn, LDHA  = ldha_adn,
+  PDK1   = pdk1_adn,  PDK3  = pdk3_adn,
+  L1MET  = l1met_adn, MET   = met_adn,
+  Tissue = "Adenoma",
+  Grade  = meta[adenoma_samples, "GradePolyp"],
+  ORF1p  = NA_real_,  ORF2p = NA_real_,
+  stringsAsFactors = FALSE
+)
+# Assign ORF values by sample name
+for (s in names(orf1p)) {
+  if (s %in% adn_df$Sample) {
+    adn_df[adn_df$Sample == s, "ORF1p"] <- orf1p[s]
+    adn_df[adn_df$Sample == s, "ORF2p"] <- orf2p[s]
+  }
+}
+cat(sprintf("    ORF1p non-NA: %d/24\n", sum(!is.na(adn_df$ORF1p))))
+
+adj_df <- data.frame(
+  Sample = adjacent_samples,
+  SIRT6  = sirt6_adj, LDHA  = ldha_adj,
+  PDK1   = pdk1_adj,  PDK3  = pdk3_adj,
+  L1MET  = l1met_adj, MET   = met_adj,
+  Tissue = "Adjacent",
+  Grade  = NA_character_,
+  ORF1p  = NA_real_,  ORF2p = NA_real_,
+  stringsAsFactors = FALSE
+)
+
+# ── 8. GTEX HEALTHY COLON ─────────────────────────────────────────────────────
+cat("[ 5/8 ] Loading GTEx healthy colon data...\n")
+gtex_genes       <- read.table(PATH_GTEX_GENES, sep = "\t", header = TRUE,
+                                check.names = FALSE, stringsAsFactors = FALSE)
+gtex_sample_cols <- colnames(gtex_genes)[-(1:2)]
+
+get_gtex <- function(gene) {
+  row <- gtex_genes[gtex_genes$gene_name == gene, gtex_sample_cols, drop = FALSE]
+  if (nrow(row) == 0) return(setNames(rep(NA_real_, length(gtex_sample_cols)),
+                                       gtex_sample_cols))
+  setNames(as.numeric(row[1, ]), gtex_sample_cols)
+}
+
+gtex_df <- data.frame(
+  Sample = gtex_sample_cols,
+  SIRT6  = get_gtex("SIRT6"), LDHA  = get_gtex("LDHA"),
+  PDK1   = get_gtex("PDK1"),  PDK3  = get_gtex("PDK3"),
+  L1MET  = NA_real_,          MET   = NA_real_,
+  Tissue = "Healthy (GTEx)",
+  Grade  = NA_character_,
+  ORF1p  = NA_real_,          ORF2p = NA_real_,
+  stringsAsFactors = FALSE
+)
+cat(sprintf("    GTEx samples: %d\n", nrow(gtex_df)))
+
+# Full combined dataset
+full_df <- bind_rows(adn_df, adj_df, gtex_df)
+full_df$Tissue <- factor(full_df$Tissue,
+                          levels = c("Healthy (GTEx)", "Adjacent", "Adenoma"))
+
+# ── 9. FIGURE 1 — ORF1p and ORF2p by adenoma grade ───────────────────────────
+cat("[ 6/8 ] Plotting figures...\n")
+cat("    Fig 1: ORF by grade\n")
+
+orf_grade_df <- adn_df %>%
+  dplyr::filter(!is.na(ORF1p) | !is.na(ORF2p)) %>%
+  dplyr::mutate(Grade = ifelse(is.na(Grade) | Grade == "",
+                               "Unknown", as.character(Grade))) %>%
+  tidyr::pivot_longer(cols = c(ORF1p, ORF2p),
+                      names_to = "ORF", values_to = "Expression")
+
+fig1 <- ggplot(orf_grade_df, aes(x = Grade, y = Expression, fill = Grade)) +
+  geom_boxplot(outlier.size = 1.5, alpha = 0.8) +
+  geom_jitter(width = 0.15, alpha = 0.5, size = 1.2) +
+  facet_wrap(~ORF, scales = "free_y",
+             labeller = labeller(ORF = c(ORF1p = "ORF1p estimate",
+                                         ORF2p = "ORF2p estimate"))) +
+  scale_fill_manual(values = pal_grade) +
+  stat_compare_means(method = "wilcox.test", label = "p.signif",
+                     comparisons = list(c("High", "Low")), na.rm = TRUE) +
+  labs(title    = "LINE-1 ORF1p and ORF2p expression by adenoma grade",
+       subtitle = "Sporadic adenomas (n=24, excl. BRAF); DESeq2 VST-normalized",
+       x = "Polip grade", y = "VST expression", fill = "Grade") +
+  theme_classic(base_size = 13) +
+  theme(strip.background = element_blank(),
+        strip.text  = element_text(face = "bold"),
+        plot.title  = element_text(face = "bold"))
+
+ggsave(file.path(OUTPUT_DIR, "fig1_ORF_by_grade.png"),
+       fig1, dpi = 180, width = 9, height = 5)
+
+# ── 10. FIGURE 2 — ORF1p vs ORF2p scatter by grade ───────────────────────────
+cat("    Fig 2: ORF1 vs ORF2 scatter\n")
+
+orf_scat <- adn_df %>%
+  dplyr::filter(!is.na(ORF1p), !is.na(ORF2p)) %>%
+  dplyr::mutate(Grade = ifelse(is.na(Grade) | Grade == "",
+                               "Unknown", as.character(Grade)))
+
+lm_12  <- lm(ORF2p ~ ORF1p, data = orf_scat)
+r2_12  <- summary(lm_12)$r.squared
+pv_12  <- summary(lm_12)$coefficients[2, 4]
+
+fig2 <- ggplot(orf_scat, aes(x = ORF1p, y = ORF2p, colour = Grade)) +
+  geom_point(size = 3, alpha = 0.85) +
+  geom_smooth(method = "lm", colour = "black", se = TRUE, linewidth = 0.8,
+              inherit.aes = FALSE, aes(x = ORF1p, y = ORF2p)) +
+  scale_colour_manual(values = pal_grade) +
+  annotate("text",
+           x = min(orf_scat$ORF1p, na.rm = TRUE),
+           y = max(orf_scat$ORF2p, na.rm = TRUE),
+           label = sprintf("R\u00b2 = %.3f\np = %.2e", r2_12, pv_12),
+           hjust = 0, vjust = 1, size = 3.5, fontface = "italic") +
+  labs(title    = "ORF1p vs ORF2p — sporadic adenomas (n=24)",
+       subtitle = "Coloured by polip grade; DESeq2 VST-normalized",
+       x = "ORF1p (VST)", y = "ORF2p (VST)", colour = "Grade") +
+  theme_classic(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+
+ggsave(file.path(OUTPUT_DIR, "fig2_ORF1_vs_ORF2_grade.png"),
+       fig2, dpi = 180, width = 7, height = 5)
+
+# ── 11. FIGURE 3 — Gene expression across tissues ────────────────────────────
+cat("    Fig 3: gene expression across tissues\n")
+
+genes       <- c("SIRT6","LDHA","PDK1","PDK3","MET","L1MET")
+gene_labels <- c("SIRT6","LDHA","PDK1","PDK3","MET","L1-MET")
+plot_list   <- list()
+
+for (i in seq_along(genes)) {
+  df_g <- full_df %>%
+    dplyr::select(Sample, Tissue, Value = all_of(genes[i])) %>%
+    dplyr::filter(!is.na(Value)) %>%
+    dplyr::mutate(Value = log1p(Value))
+
+  groups_present <- levels(droplevels(df_g$Tissue))
+  comps <- combn(groups_present, 2, simplify = FALSE)
+
+  plot_list[[i]] <- ggplot(df_g, aes(x = Tissue, y = Value, fill = Tissue)) +
+    geom_boxplot(outlier.size = 1, alpha = 0.85) +
+    geom_jitter(width = 0.15, alpha = 0.4, size = 0.8) +
+    scale_fill_manual(values = pal_tissue) +
+    stat_compare_means(comparisons = comps, method = "wilcox.test",
+                       label = "p.signif") +
+    labs(title = gene_labels[i], x = NULL, y = "log(TPM + 1)") +
+    theme_classic(base_size = 11) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 25, hjust = 1),
+          plot.title  = element_text(face = "bold", size = 12))
+}
+
+fig3 <- wrap_plots(plot_list, ncol = 3) +
+  plot_annotation(
+    title    = "Gene expression: Adenoma vs Adjacent mucosa vs Healthy colon (GTEx)",
+    subtitle = "Wilcoxon rank-sum test; log(TPM+1) | GTEx: gene-level TPM (GENCODE v10)",
+    theme    = theme(plot.title    = element_text(face = "bold", size = 14),
+                     plot.subtitle = element_text(size = 10))
+  )
+
+ggsave(file.path(OUTPUT_DIR, "fig3_gene_expression_tissues.png"),
+       fig3, dpi = 180, width = 14, height = 9)
+
+# ── 12. FIGURE 4 — Pearson correlation heatmap (adenomas only) ───────────────
+cat("    Fig 4: correlation heatmap\n")
+
+corr_df <- adn_df[, c("SIRT6","LDHA","PDK1","PDK3","MET","L1MET","ORF1p","ORF2p")]
+colnames(corr_df)[colnames(corr_df) == "L1MET"] <- "L1-MET"
+corr_df  <- corr_df[complete.cases(corr_df), ]
+
+corr_mat <- cor(corr_df, use = "complete.obs", method = "pearson")
+p_mat    <- cor_pmat(corr_df, use = "complete.obs")
+
+fig4 <- ggcorrplot(corr_mat,
+                   p.mat     = p_mat,
+                   method    = "square",
+                   type      = "full",
+                   lab       = TRUE,
+                   lab_size  = 3.5,
+                   sig.level = 0.05,
+                   insig     = "pch",
+                   pch       = 4,
+                   pch.cex   = 5,
+                   colors    = c("#E05C5C", "white", "#5B8DB8"),
+                   title     = "Pearson correlation — sporadic adenomas (n=24, excl. BRAF)",
+                   ggtheme   = theme_classic(base_size = 12))
+
+ggsave(file.path(OUTPUT_DIR, "fig4_correlation_heatmap.png"),
+       fig4, dpi = 180, width = 8, height = 7)
+
+# ── 13. FIGURE 5 — ORF1p + ORF2p vs SIRT6 and LDHA ──────────────────────────
+cat("    Fig 5: ORF vs SIRT6/LDHA regressions\n")
+
+reg_df <- adn_df %>%
+  dplyr::filter(!is.na(ORF1p), !is.na(ORF2p)) %>%
+  tidyr::pivot_longer(cols = c(ORF1p, ORF2p),
+                      names_to = "ORF", values_to = "ORF_expr")
+
+reg_plot <- function(data, x_var, x_label) {
+  ggplot(data, aes(x = .data[[x_var]], y = ORF_expr,
+                   colour = ORF, fill = ORF)) +
+    geom_point(size = 2.5, alpha = 0.8) +
+    geom_smooth(method = "lm", se = TRUE, linewidth = 0.9, alpha = 0.15) +
+    scale_colour_manual(values = pal_orf) +
+    scale_fill_manual(values   = pal_orf) +
+    stat_cor(aes(group = ORF), method = "pearson",
+             label.x.npc = "left", label.y.npc = "top", size = 3) +
+    labs(title  = paste("ORF1p / ORF2p ~", x_label),
+         x      = x_label,
+         y      = "VST expression",
+         colour = "ORF proxy",
+         fill   = "ORF proxy") +
+    theme_classic(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"))
+}
+
+fig5 <- reg_plot(reg_df, "SIRT6", "SIRT6 (mean TPM)") +
+        reg_plot(reg_df, "LDHA",  "LDHA (mean TPM)") +
+  plot_annotation(
+    title    = "LINE-1 ORF proxies vs SIRT6 and LDHA — sporadic adenomas (n=24)",
+    subtitle = "ORF1p = Strato1+Strato2 VST; ORF2p = Strato1 VST; genes = mean TPM",
+    theme    = theme(plot.title    = element_text(face = "bold", size = 13),
+                     plot.subtitle = element_text(size = 10))
+  )
+
+ggsave(file.path(OUTPUT_DIR, "fig5_ORF_vs_SIRT6_LDHA.png"),
+       fig5, dpi = 180, width = 12, height = 5)
+
+# ── 14. SUMMARY TABLE ─────────────────────────────────────────────────────────
+cat("[ 7/8 ] Computing summary statistics...\n")
+
+summary_tbl <- full_df %>%
+  dplyr::group_by(Tissue) %>%
+  dplyr::summarise(
+    n         = n(),
+    SIRT6_med = round(median(SIRT6, na.rm = TRUE), 3),
+    LDHA_med  = round(median(LDHA,  na.rm = TRUE), 3),
+    PDK1_med  = round(median(PDK1,  na.rm = TRUE), 3),
+    PDK3_med  = round(median(PDK3,  na.rm = TRUE), 3),
+    MET_med   = round(median(MET,   na.rm = TRUE), 3),
+    L1MET_med = round(median(L1MET, na.rm = TRUE), 3),
+    .groups   = "drop"
+  )
+
+print(summary_tbl)
+write.table(summary_tbl,
+            file.path(OUTPUT_DIR, "summary_statistics.tsv"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+# ── 15. STATISTICAL SUMMARY ───────────────────────────────────────────────────
+cat("[ 8/8 ] Statistical summary...\n")
+cat("\n============================================================\n")
+cat("CORRELATION ORF1p ~ ORF2p (VST)\n")
+cat("============================================================\n")
+ct <- cor.test(adn_df$ORF1p, adn_df$ORF2p, use = "complete.obs")
+cat(sprintf("  R = %.4f   R² = %.4f   p = %.2e\n",
+            ct$estimate, ct$estimate^2, ct$p.value))
+
+cat("\n============================================================\n")
+cat("REGRESSION SUMMARY (ORF VST ~ gene TPM)\n")
+cat("============================================================\n")
+models <- list(
+  "ORF1p ~ SIRT6" = lm(ORF1p ~ SIRT6, data = adn_df),
+  "ORF2p ~ SIRT6" = lm(ORF2p ~ SIRT6, data = adn_df),
+  "ORF1p ~ LDHA"  = lm(ORF1p ~ LDHA,  data = adn_df),
+  "ORF2p ~ LDHA"  = lm(ORF2p ~ LDHA,  data = adn_df)
+)
+for (nm in names(models)) {
+  s   <- summary(models[[nm]])
+  r2  <- s$r.squared
+  p   <- s$coefficients[2, 4]
+  sig <- ifelse(p < 0.001, "***", ifelse(p < 0.01, "**",
+         ifelse(p < 0.05, "*", "ns")))
+  cat(sprintf("  %-18s  R²=%.4f   p=%.4f   %s\n", nm, r2, p, sig))
+}
+
+cat("\n============================================================\n")
+cat("FULL CORRELATION MATRIX (adenomas)\n")
+cat("============================================================\n")
+print(round(corr_mat, 3))
+
+cat(sprintf("\n✅ All files saved to: %s\n", OUTPUT_DIR))
+cat("Output files:\n")
+cat("  repeats_VST_normalized.tsv\n")
+cat("  fig1_ORF_by_grade.png\n")
+cat("  fig2_ORF1_vs_ORF2_grade.png\n")
+cat("  fig3_gene_expression_tissues.png\n")
+cat("  fig4_correlation_heatmap.png\n")
+cat("  fig5_ORF_vs_SIRT6_LDHA.png\n")
+cat("  summary_statistics.tsv\n")
